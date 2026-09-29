@@ -1,0 +1,52 @@
+{
+   "name": "stomata",
+   "abstract": "Segmented automaton index for LIKE and ILIKE: anchored-, underscore- and short-pattern aware, with row-exact postings",
+   "description": "STOMATA is an index access method for text LIKE and ILIKE queries. It stores, for positional, adjacency, anchored prefix/suffix, skip-gram, rollup and row-bound composite features of the indexed strings, either the row TIDs (selective keys) or the heap pages (other keys) that contain them, and returns candidates that the executor rechecks. It filters prefixes, suffixes, 1-2 character infixes and underscore patterns that trigram indexes cannot.",
+   "version": "0.1.0",
+   "maintainer": [
+      "Sivaprasad <sivaprasad.off@gmail.com>"
+   ],
+   "license": "mit",
+   "provides": {
+      "stomata": {
+         "abstract": "Segmented automaton index access method for LIKE and ILIKE",
+         "file": "sql/stomata--0.1.0.sql",
+         "docfile": "doc/stomata.md",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "16.0.0"
+         }
+      },
+      "test": {
+         "requires": {
+            "plpgsql": 0
+         }
+      }
+   },
+   "release_status": "testing",
+   "tags": [
+      "index",
+      "access method",
+      "like",
+      "ilike",
+      "pattern matching",
+      "wildcard",
+      "text search",
+      "bitmap"
+   ],
+   "no_index": {
+      "directory": [
+         "test",
+         "tools"
+      ]
+   },
+   "generated_by": "hand",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   }
+}

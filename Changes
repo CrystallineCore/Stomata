@@ -1,0 +1,31 @@
+Revision history for PostgreSQL extension stomata.
+
+0.1.0  2026-09-29
+      - First release.
+      - Index access method for LIKE and ILIKE on text (and varchar), for
+        PostgreSQL 16, 17 and 18.  Anchored prefixes and suffixes, short
+        literals, '_' wildcards and escaped literals are indexed as well as
+        infixes.
+      - Two tiers of postings: row TIDs for selective keys, heap pages
+        (arrays or bitmaps) for the rest.
+      - Log-structured storage: inserts append to a pending list; merges
+        write sorted runs beside the old ones (size-tiered, at most 16
+        runs), so queries never wait for a merge.  Builds and merges use
+        bounded memory (maintenance_work_mem) and spill to temporary files.
+      - Summarizing access method: HOT updates stay possible; heap-only
+        tuples are indexed under their chain root.
+      - VACUUM removes dead rows from the row-level tier and recycles pages
+        once no snapshot can read them.
+      - WAL-logged through generic WAL: crash recovery, streaming
+        replication (page reuse raises recovery conflicts on hot standbys,
+        like btree), point-in-time recovery.  Unlogged indexes supported.
+      - Cost model from the index's own statistics: keys looked up at plan
+        time, selective patterns counted exactly within
+        stomata.estimate_budget (see doc/cost_model.md).
+      - SQL functions for inspection and maintenance: stomata_index_info,
+        stomata_runs, stomata_key_stats, stomata_candidate_pages,
+        stomata_keys, stomata_pattern_keys, stomata_pattern_stats,
+        stomata_estimate, stomata_merge_pending, stomata_compact,
+        stomata_verify.
+      - Tools: compare_trgm.sh, cost_oracle.py/cost_report.py, crud_wal.sh,
+        stress.sh, replication.sh, crosscheck.py.

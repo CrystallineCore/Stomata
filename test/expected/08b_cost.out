@@ -1,0 +1,193 @@
+-- Cost model: the planner's candidate estimate comes from the index itself.
+-- Selective patterns are counted exactly at plan time; otherwise the
+-- estimate is an upper bound.  The planner uses the index for selective
+-- patterns and a sequential scan when most pages would be read.
+CREATE TABLE ce (id int, w text);
+INSERT INTO ce
+SELECT i, (ARRAY['alpha','beta','gamma','delta','omega','kappa','sigma','theta'])[1 + i % 8]
+          || '-' || lpad((i * 7919 % 100000)::text, 5, '0')
+FROM generate_series(1, 20000) i;
+CREATE INDEX ce_w ON ce USING stomata (w);
+ANALYZE ce;
+-- candidates the scan returns (exact TIDs) vs the planner's count
+CREATE FUNCTION ce_check(pat text, OUT pattern text, OUT est_tids float8, OUT est_lossy float8,
+                         OUT counted bool, OUT matches bigint, OUT bound_ok bool)
+LANGUAGE plpgsql AS $$
+BEGIN
+  pattern := pat;
+  SELECT tids, lossy_pages, exact INTO est_tids, est_lossy, counted FROM stomata_estimate('ce_w', pat);
+  EXECUTE 'SELECT count(*) FROM ce WHERE w LIKE $1' INTO matches USING pat;
+  -- an estimate of exact candidates never undercounts the matches
+  bound_ok := est_lossy > 0 OR est_tids >= matches;
+END $$;
+SELECT * FROM ce_check('alpha-0%');
+ pattern  | est_tids | est_lossy | counted | matches | bound_ok 
+----------+----------+-----------+---------+---------+----------
+ alpha-0% |      249 |         0 | t       |     249 | t
+(1 row)
+
+SELECT * FROM ce_check('%-12345');
+ pattern | est_tids | est_lossy | counted | matches | bound_ok 
+---------+----------+-----------+---------+---------+----------
+ %-12345 |        0 |         0 | t       |       0 | t
+(1 row)
+
+SELECT * FROM ce_check('%ta-1%');
+ pattern | est_tids | est_lossy | counted | matches | bound_ok 
+---------+----------+-----------+---------+---------+----------
+ %ta-1%  |      751 |         0 | t       |     751 | t
+(1 row)
+
+SELECT * FROM ce_check('%zzz%');
+ pattern | est_tids | est_lossy | counted | matches | bound_ok 
+---------+----------+-----------+---------+---------+----------
+ %zzz%   |        0 |         0 | t       |       0 | t
+(1 row)
+
+SELECT * FROM ce_check('%a%');
+ pattern | est_tids | est_lossy | counted | matches | bound_ok 
+---------+----------+-----------+---------+---------+----------
+ %a%     |        0 |       109 | t       |   20000 | t
+(1 row)
+
+SELECT * FROM ce_check('_____-_____');
+   pattern   | est_tids | est_lossy | counted | matches | bound_ok 
+-------------+----------+-----------+---------+---------+----------
+ _____-_____ |        0 |       109 | t       |   17500 | t
+(1 row)
+
+-- a budget of 0 still gives an upper bound from key statistics
+SET stomata.estimate_budget = 0;
+SELECT pattern, counted, bound_ok FROM ce_check('alpha-0%');
+ pattern  | counted | bound_ok 
+----------+---------+----------
+ alpha-0% | f       | t
+(1 row)
+
+SELECT pattern, counted, bound_ok FROM ce_check('%ta-1%');
+ pattern | counted | bound_ok 
+---------+---------+----------
+ %ta-1%  | f       | t
+(1 row)
+
+RESET stomata.estimate_budget;
+-- per-key statistics behind an estimate
+SELECT key, tier, entries FROM stomata_pattern_stats('ce_w', 'omega-4%') ORDER BY key;
+   key    | tier  | entries 
+----------+-------+---------
+ G3:a-4   | exact |    2001
+ G3:ega   | exact |    2500
+ G3:ga-   | exact |    2500
+ G3:meg   | exact |    2500
+ G3:ome   | exact |    2500
+ H:F:omeg | exact |    2500
+ P:F:0:o  | exact |    2500
+ P:F:1:m  | page  |     109
+ P:F:2:e  | page  |     109
+ S2:a4    | page  |     109
+ S2:ea    | page  |     109
+ S2:g-    | page  |     109
+ S2:mg    | page  |     109
+ S2:oe    | page  |     109
+ S3:e-    | page  |     109
+ S3:g4    | page  |     109
+ S3:ma    | page  |     109
+ S3:og    | page  |     109
+ S4:e4    | page  |     109
+ S4:m-    | page  |     109
+ S4:oa    | page  |     109
+ T:F:0:me | page  |     109
+ T:F:0:om | page  |     109
+ T:F:1:a- | page  |     109
+ T:F:1:ga | page  |     109
+ U:F:1:-  | page  |     109
+ U:F:1:a  | page  |     109
+ U:F:1:g  | page  |     109
+(28 rows)
+
+-- plan choices (no sequential-scan penalty; the planner decides)
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ce WHERE w LIKE 'alpha-0%';
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on ce
+         Recheck Cond: (w ~~ 'alpha-0%'::text)
+         ->  Bitmap Index Scan on ce_w
+               Index Cond: (w ~~ 'alpha-0%'::text)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ce WHERE w LIKE '%-12345';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on ce
+         Recheck Cond: (w ~~ '%-12345'::text)
+         ->  Bitmap Index Scan on ce_w
+               Index Cond: (w ~~ '%-12345'::text)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ce WHERE w LIKE '%a%';
+             QUERY PLAN             
+------------------------------------
+ Aggregate
+   ->  Seq Scan on ce
+         Filter: (w ~~ '%a%'::text)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ce WHERE w LIKE '%';
+            QUERY PLAN            
+----------------------------------
+ Aggregate
+   ->  Seq Scan on ce
+         Filter: (w ~~ '%'::text)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ce WHERE w LIKE ANY (ARRAY['%-12345', '%-54321']);
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on ce
+         Recheck Cond: (w ~~ ANY ('{%-12345,%-54321}'::text[]))
+         ->  Bitmap Index Scan on ce_w
+               Index Cond: (w ~~ ANY ('{%-12345,%-54321}'::text[]))
+(5 rows)
+
+-- parameters: the generic estimate
+PREPARE p(text) AS SELECT count(*) FROM ce WHERE w LIKE $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE p('alpha-0%');
+              QUERY PLAN               
+---------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on ce
+         Recheck Cond: (w ~~ $1)
+         ->  Bitmap Index Scan on ce_w
+               Index Cond: (w ~~ $1)
+(5 rows)
+
+EXECUTE p('alpha-0%');
+ count 
+-------
+   249
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE p;
+-- the estimate follows the index: new rows are counted once merged
+INSERT INTO ce SELECT 20000 + i, 'zeta-' || i FROM generate_series(1, 300) i;
+SELECT stomata_merge_pending('ce_w') > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT * FROM ce_check('zeta-%');
+ pattern | est_tids | est_lossy | counted | matches | bound_ok 
+---------+----------+-----------+---------+---------+----------
+ zeta-%  |      300 |         0 | t       |     300 | t
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+DROP TABLE ce;
+DROP FUNCTION ce_check(text);

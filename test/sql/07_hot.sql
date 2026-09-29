@@ -1,0 +1,70 @@
+-- HOT updates.  A heap-only tuple is not reachable through its own line
+-- pointer, so the exact tier cannot hold it; its page is marked instead.
+-- Compare index and sequential results across tier settings.
+
+CREATE TABLE h (id int, s text, n int) WITH (fillfactor = 40);
+INSERT INTO h SELECT i, 'name' || i, 0 FROM generate_series(1, 3000) i;
+
+CREATE FUNCTION h_check(pats text[]) RETURNS TABLE (pattern text, index_rows bigint, seq_rows bigint)
+LANGUAGE plpgsql AS $$
+DECLARE p text;
+BEGIN
+  FOREACH p IN ARRAY pats LOOP
+    pattern := p;
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL enable_bitmapscan = on;
+    EXECUTE 'SELECT count(*) FROM h WHERE s LIKE $1' INTO index_rows USING p;
+    SET LOCAL enable_seqscan = on;
+    SET LOCAL enable_bitmapscan = off;
+    EXECUTE 'SELECT count(*) FROM h WHERE s LIKE $1' INTO seq_rows USING p;
+    RETURN NEXT;
+  END LOOP;
+END $$;
+
+CREATE FUNCTION h_round(opts text) RETURNS TABLE (options text, mismatched_patterns bigint, uncovered bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE h;
+  INSERT INTO h SELECT i, 'name' || i, 0 FROM generate_series(1, 3000) i;
+  EXECUTE format('CREATE INDEX h_s ON h USING stomata (s) WITH (%s)', opts);
+  UPDATE h SET n = n + 1 WHERE id % 3 = 0;                 -- HOT, key unchanged
+  UPDATE h SET s = 'renamed' || id WHERE id % 5 = 0;       -- HOT, key changed
+  UPDATE h SET s = s || 'x' WHERE id % 10 = 0;             -- HOT chains
+  options := opts;
+  SELECT count(*) INTO mismatched_patterns
+  FROM h_check(ARRAY['renamed%', '%x', 'name%', '%0x', 'name1_', '%5']) c
+  WHERE c.index_rows <> c.seq_rows;
+  uncovered := stomata_verify('h_s');
+  RETURN NEXT;
+END $$;
+
+CREATE FUNCTION h_after() RETURNS TABLE (mismatched_patterns bigint, uncovered bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE h SET s = 'again' || id WHERE id % 7 = 0;
+  SELECT count(*) INTO mismatched_patterns
+  FROM h_check(ARRAY['renamed%', '%x', 'again%', 'name%', 'again1%']) c
+  WHERE c.index_rows <> c.seq_rows;
+  uncovered := stomata_verify('h_s');
+  RETURN NEXT;
+END $$;
+
+SELECT * FROM h_round('exact = false');
+VACUUM h;
+SELECT * FROM h_after();
+DROP INDEX h_s;
+
+SELECT * FROM h_round('exact_bigrams = true');
+VACUUM h;
+SELECT * FROM h_after();
+DROP INDEX h_s;
+
+SELECT * FROM h_round('exact = true');
+VACUUM h;
+SELECT * FROM h_after();
+SELECT pending_records FROM stomata_index_info('h_s');
+-- HOT versions are indexed under the root of their chain: no whole-page (W) entries
+SELECT count(*) AS whole_page_entries FROM stomata_key_stats('h_s') WHERE family = 'W';
+DROP INDEX h_s;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_tuples_hot_updated('h'::regclass) > 0 AS hot_happened;

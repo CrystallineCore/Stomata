@@ -1,0 +1,331 @@
+-- Planner integration, operators, options, NULLs, collations and misuse.
+CREATE TABLE f (id int, w text, v varchar(40));
+INSERT INTO f SELECT i, 'item-' || i, 'v' || (i % 97) FROM generate_series(1, 2000) i;
+INSERT INTO f VALUES (0, NULL, NULL);
+CREATE INDEX f_w ON f USING stomata (w);
+CREATE INDEX f_v ON f USING stomata (v);
+CREATE INDEX f_lower ON f USING stomata (lower(w));
+CREATE INDEX f_part ON f USING stomata (w) WHERE id > 1000;
+ANALYZE f;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE w LIKE 'item-12%';
+                 QUERY PLAN                  
+---------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: (w ~~ 'item-12%'::text)
+   ->  Bitmap Index Scan on f_w
+         Index Cond: (w ~~ 'item-12%'::text)
+(4 rows)
+
+SELECT id FROM f WHERE w LIKE 'item-12_' ORDER BY id;
+ id  
+-----
+ 120
+ 121
+ 122
+ 123
+ 124
+ 125
+ 126
+ 127
+ 128
+ 129
+(10 rows)
+
+-- varchar columns use the text operator class
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE v LIKE 'v9%';
+                   QUERY PLAN                   
+------------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: ((v)::text ~~ 'v9%'::text)
+   ->  Bitmap Index Scan on f_v
+         Index Cond: ((v)::text ~~ 'v9%'::text)
+(4 rows)
+
+SELECT count(*) FROM f WHERE v LIKE 'v9_';
+ count 
+-------
+   140
+(1 row)
+
+-- expression and partial indexes
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE lower(w) LIKE 'item-1999';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: (lower(w) ~~ 'item-1999'::text)
+   ->  Bitmap Index Scan on f_lower
+         Index Cond: (lower(w) ~~ 'item-1999'::text)
+(4 rows)
+
+SELECT id FROM f WHERE lower(w) LIKE 'item-1999';
+  id  
+------
+ 1999
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE w LIKE '%-150_' AND id > 1000;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: ((w ~~ '%-150_'::text) AND (id > 1000))
+   ->  Bitmap Index Scan on f_part
+         Index Cond: (w ~~ '%-150_'::text)
+(4 rows)
+
+SELECT id FROM f WHERE w LIKE '%-150_' AND id > 1000 ORDER BY id;
+  id  
+------
+ 1500
+ 1501
+ 1502
+ 1503
+ 1504
+ 1505
+ 1506
+ 1507
+ 1508
+ 1509
+(10 rows)
+
+-- several LIKE conditions on one column are ANDed inside one index scan
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE w LIKE 'item-1%' AND w LIKE '%99';
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: ((w ~~ 'item-1%'::text) AND (w ~~ '%99'::text))
+   ->  Bitmap Index Scan on f_w
+         Index Cond: ((w ~~ 'item-1%'::text) AND (w ~~ '%99'::text))
+(4 rows)
+
+SELECT id FROM f WHERE w LIKE 'item-1%' AND w LIKE '%99' ORDER BY id;
+  id  
+------
+  199
+ 1099
+ 1199
+ 1299
+ 1399
+ 1499
+ 1599
+ 1699
+ 1799
+ 1899
+ 1999
+(11 rows)
+
+-- runtime parameters (prepared statement, generic plan)
+PREPARE q(text) AS SELECT count(*) FROM f WHERE w LIKE $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE q('item-7%');
+              QUERY PLAN              
+--------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on f
+         Recheck Cond: (w ~~ $1)
+         ->  Bitmap Index Scan on f_w
+               Index Cond: (w ~~ $1)
+(5 rows)
+
+EXECUTE q('item-7%');
+ count 
+-------
+   111
+(1 row)
+
+EXECUTE q('%-7');
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE q(NULL);
+ count 
+-------
+     0
+(1 row)
+
+RESET plan_cache_mode;
+-- ESCAPE clause is folded into a backslash pattern
+SELECT count(*) FROM f WHERE w LIKE 'item#-1%' ESCAPE '#';
+ count 
+-------
+  1111
+(1 row)
+
+-- a trailing escape is still an error, as without the index
+SELECT count(*) FROM f WHERE w LIKE 'item\';
+ERROR:  LIKE pattern must not end with escape character
+-- NOT LIKE is not indexable
+RESET enable_seqscan;
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE w NOT LIKE 'item%';
+           QUERY PLAN            
+---------------------------------
+ Seq Scan on f
+   Filter: (w !~~ 'item%'::text)
+(2 rows)
+
+SET enable_seqscan = off;
+-- ILIKE is indexed (strategy 2), alone and mixed with LIKE
+EXPLAIN (COSTS OFF) SELECT id FROM f WHERE w ILIKE 'ITEM-1_';
+                 QUERY PLAN                  
+---------------------------------------------
+ Bitmap Heap Scan on f
+   Recheck Cond: (w ~~* 'ITEM-1_'::text)
+   ->  Bitmap Index Scan on f_w
+         Index Cond: (w ~~* 'ITEM-1_'::text)
+(4 rows)
+
+SELECT count(*) FROM f WHERE w ILIKE 'ITEM-1_';
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM f WHERE w ILIKE 'ITEM-1%' AND w LIKE '%9';
+ count 
+-------
+   111
+(1 row)
+
+SELECT count(*) FROM f WHERE w ~~* '%-19__';
+ count 
+-------
+   100
+(1 row)
+
+SELECT stomata_candidate_pages('f_w', 'ITEM-1_', true) > 0 AS ilike_candidates;
+ ilike_candidates 
+------------------
+ t
+(1 row)
+
+-- NULLs are not indexed and never match
+SELECT count(*) FROM f WHERE w LIKE '%';
+ count 
+-------
+  2000
+(1 row)
+
+SELECT count(*) FROM f WHERE w IS NULL;
+ count 
+-------
+     1
+(1 row)
+
+-- empty table, then data
+CREATE TABLE e (w text);
+CREATE INDEX e_w ON e USING stomata (w);
+SELECT count(*) FROM e WHERE w LIKE 'a%';
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO e VALUES ('abc');
+SELECT w FROM e WHERE w LIKE 'a%';
+  w  
+-----
+ abc
+(1 row)
+
+SELECT stomata_verify('e_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+-- unlogged table
+CREATE UNLOGGED TABLE u (w text);
+INSERT INTO u SELECT 'u' || i FROM generate_series(1, 500) i;
+CREATE INDEX u_w ON u USING stomata (w);
+SELECT count(*) FROM u WHERE w LIKE 'u4%';
+ count 
+-------
+   111
+(1 row)
+
+SELECT stomata_verify('u_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+-- reloption validation
+CREATE INDEX bad ON f USING stomata (w) WITH (k = 0);
+ERROR:  value 0 out of bounds for option "k"
+DETAIL:  Valid values are between "1" and "8".
+CREATE INDEX bad ON f USING stomata (w) WITH (rollup = 5);
+ERROR:  value 5 out of bounds for option "rollup"
+DETAIL:  Valid values are between "0" and "4".
+CREATE INDEX bad ON f USING stomata (w) WITH (stop_threshold = 1.5);
+ERROR:  value 1.5 out of bounds for option "stop_threshold"
+DETAIL:  Valid values are between "0.000000" and "1.000000".
+CREATE INDEX bad ON f USING stomata (w) WITH (nonsense = 1);
+ERROR:  unrecognized parameter "nonsense"
+CREATE INDEX bad ON f USING stomata (w) WITH (anchor_len = 5);
+ERROR:  value 5 out of bounds for option "anchor_len"
+DETAIL:  Valid values are between "0" and "4".
+CREATE INDEX bad ON f USING stomata (w) WITH (skip_depth = 9);
+ERROR:  value 9 out of bounds for option "skip_depth"
+DETAIL:  Valid values are between "0" and "8".
+-- reverse_depth is clamped to cap
+CREATE INDEX f_clamp ON f USING stomata (w) WITH (cap = 1, reverse_depth = 5);
+SELECT cap, reverse_depth FROM stomata_index_info('f_clamp');
+ cap | reverse_depth 
+-----+---------------
+   1 |             1
+(1 row)
+
+DROP INDEX f_clamp;
+-- unsupported shapes
+CREATE INDEX bad ON f USING stomata (w, v);
+ERROR:  access method "stomata" does not support multicolumn indexes
+CREATE INDEX bad ON f USING stomata (id);
+ERROR:  data type integer has no default operator class for access method "stomata"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+CREATE UNIQUE INDEX bad ON f USING stomata (w);
+ERROR:  access method "stomata" does not support unique indexes
+-- dictionary composition
+SELECT family, tier, keys > 0 AS has_keys FROM stomata_key_stats('f_w') ORDER BY family, tier;
+ family | tier  | has_keys 
+--------+-------+----------
+ G1     | page  | t
+ G2     | page  | t
+ G3     | exact | t
+ H:F    | exact | t
+ H:R    | exact | t
+ P:F    | page  | t
+ P:F0   | exact | t
+ P:R    | page  | t
+ P:R0   | exact | t
+ S2     | page  | t
+ S3     | page  | t
+ S4     | page  | t
+ T:F    | page  | t
+ T:R    | page  | t
+ U:F    | page  | t
+ U:R    | page  | t
+ X.a    | page  | t
+ X.b    | page  | t
+ X.c    | page  | t
+ X.d    | page  | t
+ X.e    | page  | t
+ X.f    | page  | t
+(22 rows)
+
+-- functions reject other index types and non-indexes
+CREATE INDEX f_btree ON f (w);
+SELECT stomata_index_info('f_btree');
+ERROR:  "f_btree" is not a stomata index
+SELECT stomata_verify('f');
+ERROR:  "f" is not an index
+DROP INDEX f_btree;
+-- an explicit deterministic collation keeps using the index
+SELECT count(*) FROM f WHERE w COLLATE "C" LIKE 'item-1%';
+ count 
+-------
+  1111
+(1 row)
+
+RESET enable_seqscan;

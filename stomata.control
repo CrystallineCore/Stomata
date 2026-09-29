@@ -1,0 +1,6 @@
+# stomata extension
+comment = 'STOMATA: segmented automaton index for LIKE and ILIKE'
+default_version = '0.1.0'
+module_pathname = '$libdir/stomata'
+relocatable = true
+trusted = false

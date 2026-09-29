@@ -1,0 +1,231 @@
+-- Key extraction and pattern compilation (default parameters: k=3, cap=2,
+-- rollup=3, reverse_depth=1, composite, no cross edges).
+SELECT k FROM stomata_keys('hello') k ORDER BY 1;
+     k      
+------------
+ G1:\0
+ G1:e
+ G1:h
+ G1:l
+ G1:o
+ G2:el
+ G2:he
+ G2:ll
+ G2:lo
+ G2:o\0
+ G3:ell
+ G3:hel
+ G3:llo
+ G3:lo\0
+ H:F:he
+ H:F:hel
+ H:F:hell
+ H:R:ol
+ H:R:oll
+ H:R:olle
+ P:F:0:h
+ P:F:1:e
+ P:F:2:l
+ P:R:0:o
+ P:R:1:l
+ P:R:2:l
+ S2:el
+ S2:hl
+ S2:l\0
+ S2:lo
+ S3:eo
+ S3:hl
+ S3:l\0
+ S4:e\0
+ S4:ho
+ T:F:0:el
+ T:F:0:he
+ T:F:1:lo
+ T:F:1:o\0
+ T:R:0:ll
+ T:R:0:ol
+ U:F:0:e
+ U:F:0:h
+ U:F:0:l
+ U:F:1:\0
+ U:F:1:l
+ U:F:1:o
+ U:R:0:l
+ U:R:0:o
+ X.HL:h:1
+ X.HT:he,lo
+ X.Ht:he,o
+ X.TL:o:1
+ X.hT:h,lo
+ X.ht:h,o
+(55 rows)
+
+SELECT count(*) FROM stomata_keys('');
+ count 
+-------
+     5
+(1 row)
+
+SELECT k FROM stomata_keys('HeLLo') k EXCEPT SELECT k FROM stomata_keys('hello') k;
+ k 
+---
+(0 rows)
+
+-- Anchored prefix, suffix, exact-with-underscores, infix.
+SELECT k FROM stomata_pattern_keys('hel%') k ORDER BY 1;
+    k     
+----------
+ G3:hel
+ H:F:hel
+ P:F:0:h
+ P:F:1:e
+ P:F:2:l
+ S2:hl
+ T:F:0:el
+ T:F:0:he
+(8 rows)
+
+SELECT k FROM stomata_pattern_keys('%lo') k ORDER BY 1;
+    k     
+----------
+ G3:lo\0
+ H:R:ol
+ P:R:0:o
+ P:R:1:l
+ S2:l\0
+ T:R:0:ol
+(6 rows)
+
+SELECT k FROM stomata_pattern_keys('h___o') k ORDER BY 1;
+     k     
+-----------
+ G1:h
+ G2:o\0
+ P:F:0:h
+ P:R:0:o
+ S4:ho
+ T:F:1:o\0
+ U:F:1:\0
+ U:F:1:o
+ X.HL:h:1
+ X.TL:o:1
+ X.ht:h,o
+(11 rows)
+
+SELECT k FROM stomata_pattern_keys('%el%') k ORDER BY 1;
+   k   
+-------
+ G2:el
+(1 row)
+
+SELECT k FROM stomata_pattern_keys('ab%cd%ef') k ORDER BY 1;
+     k      
+------------
+ G2:ab
+ G2:cd
+ G3:ef\0
+ H:F:ab
+ H:R:fe
+ P:F:0:a
+ P:F:1:b
+ P:R:0:f
+ P:R:1:e
+ S2:e\0
+ T:F:0:ab
+ T:R:0:fe
+ X.HT:ab,ef
+ X.Ht:ab,f
+ X.hT:a,ef
+ X.ht:a,f
+(16 rows)
+
+-- Every pattern key must be among the value's keys when the value matches.
+SELECT v, p, v LIKE p AS matches,
+       NOT EXISTS (SELECT stomata_pattern_keys(p) EXCEPT SELECT stomata_keys(v)) AS keys_subset
+FROM (VALUES ('hello', 'hel%'), ('hello', '%lo'), ('hello', 'h___o'), ('hello', '%el%'),
+             ('pablo', 'pab__'), ('apples', 'app%s'), ('snake_case', 'snake\_%'),
+             ('café', 'caf_'), ('日本語テキスト', '日%スト'), ('100%', '100\%')) t(v, p);
+       v        |    p     | matches | keys_subset 
+----------------+----------+---------+-------------
+ hello          | hel%     | t       | t
+ hello          | %lo      | t       | t
+ hello          | h___o    | t       | t
+ hello          | %el%     | t       | t
+ pablo          | pab__    | t       | t
+ apples         | app%s    | t       | t
+ snake_case     | snake\_% | t       | t
+ café           | caf_     | t       | t
+ 日本語テキスト | 日%スト  | t       | t
+ 100%           | 100\%    | t       | t
+(10 rows)
+
+-- Patterns with no usable keys compile to an empty set (full scan).
+SELECT p, count(k) FROM (VALUES ('%'), ('%%'), ('_%'), ('')) t(p)
+LEFT JOIN LATERAL stomata_pattern_keys(p) k ON true GROUP BY p ORDER BY p;
+ p  | count 
+----+-------
+    |     3
+ %  |     0
+ %% |     0
+ _% |     0
+(4 rows)
+
+SELECT count(*) FROM stomata_pattern_keys('abc\');
+ count 
+-------
+     0
+(1 row)
+
+-- Parameters change the key set.
+SELECT count(*) FROM stomata_keys('hello', k => 1, cap => 8);
+ count 
+-------
+    44
+(1 row)
+
+SELECT count(*) FROM stomata_keys('hello', rollup => 0, composite => false);
+ count 
+-------
+    35
+(1 row)
+
+SELECT k FROM stomata_keys('abcdef', cross_edges => true) k WHERE k LIKE 'C:%' ORDER BY 1;
+    k     
+----------
+ C:F:0:cd
+(1 row)
+
+SELECT count(*) FROM stomata_keys('x', k => 9);
+ERROR:  k must be between 1 and 8
+SELECT count(*) FROM stomata_keys('x', rollup => 5);
+ERROR:  rollup must be between 0 and 4
+-- Rows with non-ASCII bytes carry the N marker (ILIKE fallback).
+SELECT v, 'N' IN (SELECT stomata_keys(v)) AS marked
+FROM (VALUES ('hello'), ('café'), ('日本')) t(v);
+   v   | marked 
+-------+--------
+ hello | f
+ café  | t
+ 日本  | t
+(3 rows)
+
+-- ILIKE folds ASCII in the pattern and turns non-ASCII literals into '_'.
+SELECT k FROM stomata_pattern_keys('HeL%', ilike => true) k ORDER BY 1;
+    k     
+----------
+ G3:hel
+ H:F:hel
+ P:F:0:h
+ P:F:1:e
+ P:F:2:l
+ S2:hl
+ T:F:0:el
+ T:F:0:he
+(8 rows)
+
+SELECT k FROM stomata_pattern_keys('caf_', ilike => true) k
+EXCEPT SELECT k FROM stomata_pattern_keys('café', ilike => true) k ORDER BY 1;
+ k 
+---
+(0 rows)
+

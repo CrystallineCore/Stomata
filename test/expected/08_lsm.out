@@ -1,0 +1,298 @@
+-- Log-structured maintenance: runs, incremental merges, compaction,
+-- bounded-memory builds and merges, page recycling.
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+CREATE FUNCTION lsm_mismatches(tbl regclass) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  n bigint := 0;
+  p text;
+  a bigint;
+  b bigint;
+BEGIN
+  FOR p IN SELECT unnest(ARRAY['a%', '%a', '%ab%', '%e_e%', '_b%', '%s', 'lsm%', '%42', '%x%y%',
+                               'lsm_1__', '%9', '%', '%zz%', '__', '%row%'])
+  LOOP
+    EXECUTE format('SELECT count(*) FROM %s WHERE w LIKE %L', tbl, p) INTO a;
+    SET LOCAL enable_seqscan = on;
+    SET LOCAL enable_bitmapscan = off;
+    EXECUTE format('SELECT count(*) FROM %s WHERE w LIKE %L', tbl, p) INTO b;
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL enable_bitmapscan = on;
+    IF a <> b THEN
+      RAISE NOTICE 'mismatch for %: index % seq %', p, a, b;
+      n := n + 1;
+    END IF;
+  END LOOP;
+  RETURN n;
+END $$;
+-- Small pending limit: inserts trigger merges, each adding a run.
+CREATE TABLE lsm (id int, w text);
+INSERT INTO lsm SELECT id, w FROM words WHERE w IS NOT NULL;
+CREATE INDEX lsm_w ON lsm USING stomata (w) WITH (pending_limit = 8);
+SELECT runs FROM stomata_index_info('lsm_w');
+ runs 
+------
+    1
+(1 row)
+
+DO $$
+BEGIN
+  FOR b IN 1..12 LOOP
+    INSERT INTO lsm SELECT 10000 * b + i, 'lsm_' || b || '_' || md5(i::text)
+    FROM generate_series(1, 400) i;
+  END LOOP;
+END $$;
+-- several runs, oldest (largest) first, sizes decreasing
+SELECT runs > 1 AS several_runs, runs <= 16 AS within_limit FROM stomata_index_info('lsm_w');
+ several_runs | within_limit 
+--------------+--------------
+ t            | t
+(1 row)
+
+SELECT bool_and(r1.bytes >= r2.bytes / 4) AS tiered
+FROM stomata_runs('lsm_w') r1 JOIN stomata_runs('lsm_w') r2 ON r2.run = r1.run + 1;
+ tiered 
+--------
+ t
+(1 row)
+
+SELECT (SELECT sum(rows) FROM stomata_runs('lsm_w'))
+       + (SELECT pending_records FROM stomata_index_info('lsm_w'))
+       = (SELECT count(*) FROM lsm) AS all_rows_indexed;
+ all_rows_indexed 
+------------------
+ t
+(1 row)
+
+SELECT lsm_mismatches('lsm');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+SELECT stomata_verify('lsm_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+-- ILIKE and multi-pattern scans across runs
+SELECT count(*) FROM lsm WHERE w ILIKE 'LSM\_3\_%';
+ count 
+-------
+   400
+(1 row)
+
+SELECT count(*) FROM lsm WHERE w LIKE 'lsm%' AND w LIKE '%a';
+ count 
+-------
+   276
+(1 row)
+
+-- merging the pending list and then compacting everything
+SELECT stomata_merge_pending('lsm_w') >= 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT pending_records FROM stomata_index_info('lsm_w');
+ pending_records 
+-----------------
+               0
+(1 row)
+
+SELECT stomata_compact('lsm_w') >= 0 AS compacted;
+ compacted 
+-----------
+ t
+(1 row)
+
+SELECT runs FROM stomata_index_info('lsm_w');
+ runs 
+------
+    1
+(1 row)
+
+SELECT lsm_mismatches('lsm');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+SELECT stomata_verify('lsm_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+-- a compacted index holds the same keys as a fresh build
+CREATE INDEX lsm_w_fresh ON lsm USING stomata (w);
+SELECT count(*) AS differing_families FROM (
+  (SELECT family, tier, keys, stop_keys FROM stomata_key_stats('lsm_w')
+   EXCEPT SELECT family, tier, keys, stop_keys FROM stomata_key_stats('lsm_w_fresh'))
+  UNION ALL
+  (SELECT family, tier, keys, stop_keys FROM stomata_key_stats('lsm_w_fresh')
+   EXCEPT SELECT family, tier, keys, stop_keys FROM stomata_key_stats('lsm_w'))) d;
+ differing_families 
+--------------------
+                  0
+(1 row)
+
+DROP INDEX lsm_w_fresh;
+-- deletes and updates, then VACUUM: still sound, pages are recycled
+DELETE FROM lsm WHERE id % 3 = 0;
+UPDATE lsm SET w = w || 'x' WHERE id % 5 = 0;
+VACUUM lsm;
+SELECT lsm_mismatches('lsm');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+SELECT stomata_verify('lsm_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+SELECT pg_relation_size('lsm_w') AS size_before \gset
+DO $$
+BEGIN
+  FOR b IN 1..5 LOOP
+    UPDATE lsm SET w = w WHERE id % 7 = b;
+    PERFORM stomata_merge_pending('lsm_w');
+  END LOOP;
+END $$;
+VACUUM lsm;
+SELECT stomata_compact('lsm_w') >= 0 AS compacted;
+ compacted 
+-----------
+ t
+(1 row)
+
+VACUUM lsm;
+SELECT pg_relation_size('lsm_w') <= 3 * :size_before AS bounded_growth;
+ bounded_growth 
+----------------
+ t
+(1 row)
+
+SELECT lsm_mismatches('lsm');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+-- VACUUM removes dead rows from the row-level (exact) tier
+CREATE FUNCTION index_rows(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, FORMAT JSON) ' || q INTO j;
+  RETURN (SELECT (x->>'Actual Rows')::numeric::bigint
+          FROM json_array_elements(j->0->'Plan'->'Plans') p0,
+               json_array_elements(p0->'Plans') x
+          WHERE x->>'Node Type' = 'Bitmap Index Scan');
+END $$;
+CREATE TABLE pur (id int, w text) WITH (autovacuum_enabled = off);
+INSERT INTO pur SELECT i, 'pur_' || i FROM generate_series(1, 20000) i;
+CREATE INDEX pur_w ON pur USING stomata (w);
+DELETE FROM pur WHERE id % 2 = 0;
+SELECT index_rows($$SELECT count(*) FROM pur WHERE w LIKE 'pur\_1___'$$) AS candidates_before;
+ candidates_before 
+-------------------
+              1000
+(1 row)
+
+VACUUM pur;
+SELECT index_rows($$SELECT count(*) FROM pur WHERE w LIKE 'pur\_1___'$$) AS candidates_after;
+ candidates_after 
+------------------
+              500
+(1 row)
+
+SELECT count(*) FROM pur WHERE w LIKE 'pur\_1___';
+ count 
+-------
+   500
+(1 row)
+
+SELECT sum(rows) FROM stomata_runs('pur_w');
+  sum  
+-------
+ 10000
+(1 row)
+
+SELECT stomata_verify('pur_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+SELECT lsm_mismatches('pur');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+-- small runs are purged of even a few dead rows
+DELETE FROM pur WHERE id % 1000 = 1;
+VACUUM pur;
+SELECT sum(rows) FROM stomata_runs('pur_w');
+ sum  
+------
+ 9980
+(1 row)
+
+SELECT stomata_verify('pur_w');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+DROP TABLE pur;
+-- bounded memory: builds and merges spill sorted runs to temporary files
+CREATE TABLE big (id int, w text);
+INSERT INTO big SELECT i, 'row' || (i * 7919 % 100000) || '_' || substr(md5(i::text), 1, 6)
+FROM generate_series(1, 40000) i;
+SET maintenance_work_mem = '1MB';
+CREATE INDEX big_small ON big USING stomata (w);
+RESET maintenance_work_mem;
+CREATE INDEX big_large ON big USING stomata (w);
+SELECT count(*) AS differing_families FROM (
+  (SELECT * FROM stomata_key_stats('big_small') EXCEPT SELECT * FROM stomata_key_stats('big_large'))
+  UNION ALL
+  (SELECT * FROM stomata_key_stats('big_large') EXCEPT SELECT * FROM stomata_key_stats('big_small'))) d;
+ differing_families 
+--------------------
+                  0
+(1 row)
+
+DROP INDEX big_large;
+INSERT INTO big SELECT i, 'row' || (i::bigint * 104729 % 100000) || '_' || substr(md5(i::text), 1, 6)
+FROM generate_series(40001, 60000) i;
+SET maintenance_work_mem = '1MB';
+SELECT stomata_merge_pending('big_small');
+ stomata_merge_pending 
+-----------------------
+                 20000
+(1 row)
+
+RESET maintenance_work_mem;
+SELECT lsm_mismatches('big');
+ lsm_mismatches 
+----------------
+              0
+(1 row)
+
+SELECT stomata_verify('big_small');
+ stomata_verify 
+----------------
+              0
+(1 row)
+
+DROP TABLE big;
+DROP TABLE lsm;
+DROP FUNCTION lsm_mismatches(regclass);
+RESET enable_seqscan;
+RESET enable_indexscan;
