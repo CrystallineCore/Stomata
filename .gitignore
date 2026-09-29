@@ -1,0 +1,6 @@
+*.so
+*.bc
+*.o
+*.zip
+docs/build/
+docs/.venv/
